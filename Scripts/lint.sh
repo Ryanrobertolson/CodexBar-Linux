@@ -92,11 +92,17 @@ check_mimo_usage_script() {
 }
 
 check_swift_test_sharding() {
+  python3 "${ROOT_DIR}/Scripts/test_direct_swift_test_groups.py"
   "${ROOT_DIR}/Scripts/test_swift_test_sharding.sh"
 }
 
 check_ci_path_gate() {
   "${ROOT_DIR}/Scripts/test_ci_path_gate.sh"
+}
+
+check_ci_build_cache() {
+  python3 "${ROOT_DIR}/Scripts/test_ci_swiftpm_cache.py"
+  python3 "${ROOT_DIR}/Scripts/test_ci_prune_swiftpm_cache.py"
 }
 
 check_homebrew_tap_wait() {
@@ -120,8 +126,10 @@ check_shell_scripts() {
 }
 
 check_app_locales() {
+  node --test "${ROOT_DIR}/Scripts/test_localization_formats.mjs"
   node "${ROOT_DIR}/Scripts/check-app-locales.mjs" --test
   node "${ROOT_DIR}/Scripts/check-app-locales.mjs"
+  node "${ROOT_DIR}/Scripts/sync-widget-locales.mjs" --check
 }
 
 check_site_locales() {
@@ -139,6 +147,8 @@ check_llms_index() {
 }
 
 run_portable_checks() {
+  python3 "${ROOT_DIR}/Scripts/acknowledgements.py"
+  python3 "${ROOT_DIR}/Scripts/test_acknowledgements.py"
   check_package_resolved
   check_codex_parser_hash
   check_provider_manifests
@@ -156,6 +166,9 @@ run_portable_checks() {
   check_mimo_usage_script
   check_swift_test_sharding
   check_ci_path_gate
+  python3 "${ROOT_DIR}/Scripts/test_linux_cli_linkage.py"
+  python3 "${ROOT_DIR}/Scripts/test_linux_cli_codex_cost_smoke.py"
+  check_ci_build_cache
   check_homebrew_tap_wait
   check_repository_size
   check_shell_scripts

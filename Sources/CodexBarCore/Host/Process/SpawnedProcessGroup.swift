@@ -148,23 +148,7 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
 
         #if canImport(Darwin)
         private static func process(pid: pid_t, holdsAny pipes: Set<OutputPipeIdentity>) -> Bool {
-            let requiredBytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
-            guard requiredBytes > 0 else { return false }
-            let stride = MemoryLayout<proc_fdinfo>.stride
-            var descriptors = [proc_fdinfo](
-                repeating: proc_fdinfo(),
-                count: Int(requiredBytes) / stride + 8)
-            let actualBytes = descriptors.withUnsafeMutableBytes { buffer in
-                proc_pidinfo(
-                    pid,
-                    PROC_PIDLISTFDS,
-                    0,
-                    buffer.baseAddress,
-                    Int32(buffer.count))
-            }
-            guard actualBytes > 0 else { return false }
-
-            for descriptor in descriptors.prefix(Int(actualBytes) / stride)
+            for descriptor in DarwinProcessEnumerator.fileDescriptors(pid: pid)
                 where descriptor.proc_fdtype == PROX_FDTYPE_PIPE
             {
                 var info = pipe_fdinfo()
@@ -233,23 +217,7 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
 
         #if canImport(Darwin)
         private static func process(pid: pid_t, holdsAny terminals: Set<OutputTTYIdentity>) -> Bool {
-            let requiredBytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
-            guard requiredBytes > 0 else { return false }
-            let stride = MemoryLayout<proc_fdinfo>.stride
-            var descriptors = [proc_fdinfo](
-                repeating: proc_fdinfo(),
-                count: Int(requiredBytes) / stride + 8)
-            let actualBytes = descriptors.withUnsafeMutableBytes { buffer in
-                proc_pidinfo(
-                    pid,
-                    PROC_PIDLISTFDS,
-                    0,
-                    buffer.baseAddress,
-                    Int32(buffer.count))
-            }
-            guard actualBytes > 0 else { return false }
-
-            for descriptor in descriptors.prefix(Int(actualBytes) / stride)
+            for descriptor in DarwinProcessEnumerator.fileDescriptors(pid: pid)
                 where descriptor.proc_fdtype == PROX_FDTYPE_VNODE
             {
                 var info = vnode_fdinfo()
@@ -276,7 +244,7 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
 
     private static func allProcessIDs() -> [pid_t] {
         #if canImport(Darwin)
-        return self.processIDs(type: UInt32(PROC_ALL_PIDS), typeInfo: 0)
+        return DarwinProcessEnumerator.allPIDs()
         #else
         guard let entries = try? FileManager.default.contentsOfDirectory(atPath: "/proc") else { return [] }
         return entries.compactMap(pid_t.init)
@@ -292,29 +260,11 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
 
     private static func processIDs(inProcessGroup processGroup: pid_t) -> [pid_t] {
         #if canImport(Darwin)
-        return self.processIDs(type: UInt32(PROC_PGRP_ONLY), typeInfo: UInt32(bitPattern: processGroup))
+        return DarwinProcessEnumerator.allPIDs(type: UInt32(PROC_PGRP_ONLY), typeInfo: UInt32(bitPattern: processGroup))
         #else
         return self.allProcessIDs().filter { getpgid($0) == processGroup }
         #endif
     }
-
-    #if canImport(Darwin)
-    private static func processIDs(type: UInt32, typeInfo: UInt32) -> [pid_t] {
-        let requiredBytes = proc_listpids(type, typeInfo, nil, 0)
-        guard requiredBytes > 0 else { return [] }
-        let stride = MemoryLayout<pid_t>.stride
-        var pids = [pid_t](repeating: 0, count: Int(requiredBytes) / stride + 32)
-        let actualBytes = pids.withUnsafeMutableBytes { buffer in
-            proc_listpids(
-                type,
-                typeInfo,
-                buffer.baseAddress,
-                Int32(buffer.count))
-        }
-        guard actualBytes > 0 else { return [] }
-        return Array(pids.prefix(Int(actualBytes) / stride)).filter { $0 > 0 }
-    }
-    #endif
 
     package let pid: pid_t
     package let processGroup: pid_t
@@ -649,20 +599,23 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
     }
 
     @discardableResult
-    package func terminate(grace: TimeInterval = 0.4) async -> Int32? {
+    package func terminate(
+        grace: TimeInterval = 0.4,
+        now: @Sendable () -> Date = Date.init,
+        sleep: @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) }) async -> Int32?
+    {
         if self.isRunning {
-            let killDeadline = Date().addingTimeInterval(max(0, grace))
+            let killDeadline = now().addingTimeInterval(max(0, grace))
             var processIdentities = self.currentResidualProcessIdentities(includeDescendants: true)
             processIdentities.formUnion(self.currentProcessGroupMemberIdentities())
             if let rootIdentity = TTYProcessTreeTerminator.processIdentity(for: self.pid) {
                 processIdentities.insert(rootIdentity)
             }
             Self.signal(processIdentities: processIdentities, signal: SIGTERM)
-            _ = await self.waitForExit(timeout: max(0, killDeadline.timeIntervalSinceNow))
-            while processIdentities.contains(where: TTYProcessTreeTerminator.isCurrent(_:)),
-                  Date() < killDeadline
+            while self.isRunning || processIdentities.contains(where: TTYProcessTreeTerminator.isCurrent(_:)),
+                  now() < killDeadline
             {
-                try? await Task.sleep(for: .milliseconds(20))
+                await sleep(.milliseconds(20))
             }
 
             processIdentities.formUnion(self.currentResidualProcessIdentities(includeDescendants: false))
@@ -672,11 +625,9 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
                 if let rootIdentity = TTYProcessTreeTerminator.processIdentity(for: self.pid) {
                     processIdentities.insert(rootIdentity)
                 }
-                Self.signal(processIdentities: processIdentities, signal: SIGKILL)
-                _ = await self.waitForExit(timeout: grace)
-            } else {
-                Self.signal(processIdentities: processIdentities, signal: SIGKILL)
             }
+            Self.signal(processIdentities: processIdentities, signal: SIGKILL)
+            _ = await self.waitForExit(timeout: grace)
             _ = await self.waitForResidualProcessesExit(processIdentities, timeout: grace)
             await self.finish()
             return self.terminationStatus
@@ -968,7 +919,8 @@ extension SpawnedProcessGroup {
             excludedPIDs: Set<pid_t>,
             grace: TimeInterval,
             preKillSnapshotHook: (@Sendable () -> Void)?,
-            maxLifetime: TimeInterval)
+            maxLifetime: TimeInterval,
+            now: DispatchTime = .now())
         {
             self.duplicatedPrimaryFileDescriptor = duplicatedPrimaryFileDescriptor
             self.outputPipes = outputPipes
@@ -976,7 +928,7 @@ extension SpawnedProcessGroup {
             self.excludedPIDs = excludedPIDs
             self.grace = max(0, grace)
             self.preKillSnapshotHook = preKillSnapshotHook
-            self.deadline = .now() + max(0, maxLifetime)
+            self.deadline = now + max(0, maxLifetime)
             self.completion.enter()
         }
 
@@ -984,11 +936,12 @@ extension SpawnedProcessGroup {
             self.withActiveState { true } == true
         }
 
-        func scheduleExpiry() {
-            let deadline = self.deadline
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: deadline) { [self] in
-                self.finish()
-            }
+        func scheduleExpiry(
+            schedule: (DispatchTime, @escaping @Sendable () -> Void) -> Void = {
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: $0, execute: $1)
+            })
+        {
+            schedule(self.deadline) { self.finish() }
         }
 
         func withActiveState<T>(_ operation: () -> T) -> T? {
@@ -1201,7 +1154,9 @@ extension SpawnedProcessGroup {
     package static func _test_outputHolderCleanupLeaseExpiry(
         ownedFileDescriptor: Int32,
         maxLifetime: TimeInterval,
-        waitTimeout: TimeInterval) -> (completed: Bool, active: Bool)
+        waitTimeout: TimeInterval,
+        now: DispatchTime,
+        schedule: (DispatchTime, @escaping @Sendable () -> Void) -> Void) -> (completed: Bool, active: Bool)
     {
         let lease = OutputHolderCleanupLease(
             duplicatedPrimaryFileDescriptor: ownedFileDescriptor,
@@ -1210,8 +1165,9 @@ extension SpawnedProcessGroup {
             excludedPIDs: [],
             grace: 0,
             preKillSnapshotHook: nil,
-            maxLifetime: maxLifetime)
-        lease.scheduleExpiry()
+            maxLifetime: maxLifetime,
+            now: now)
+        lease.scheduleExpiry(schedule: schedule)
         let completed = lease.waitForCompletion(timeout: waitTimeout)
         return (completed, lease.isActive)
     }

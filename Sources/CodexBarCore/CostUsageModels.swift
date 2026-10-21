@@ -112,68 +112,6 @@ public struct CostUsageQuotaWeek: Sendable, Equatable {
     }
 }
 
-/// An estimated local Codex conversation total derived from one session log.
-/// This is intentionally distinct from account-level billing or quota data.
-public struct CostUsageSessionBreakdown: Sendable, Equatable, Identifiable {
-    public let sessionID: String
-    public let lastActivity: Date
-    public let inputTokens: Int?
-    public let cachedInputTokens: Int?
-    public let outputTokens: Int?
-    public let reasoningTokens: Int?
-    public let totalTokens: Int?
-    public let requestCount: Int?
-    public let costUSD: Double?
-    public let modelBreakdowns: [CostUsageDailyReport.ModelBreakdown]
-    /// Canonical project path, matching the key of the session's Projects row.
-    public let projectPath: String?
-    public let projectName: String?
-    /// Thread name from Codex metadata, when one exists.
-    public private(set) var title: String?
-    /// Original rollout directory; relative SQLite homes must not use the canonical project path.
-    var workingDirectory: String?
-
-    public var id: String {
-        self.sessionID
-    }
-
-    public init(
-        sessionID: String,
-        lastActivity: Date,
-        inputTokens: Int?,
-        cachedInputTokens: Int?,
-        outputTokens: Int?,
-        reasoningTokens: Int? = nil,
-        totalTokens: Int?,
-        requestCount: Int?,
-        costUSD: Double?,
-        modelBreakdowns: [CostUsageDailyReport.ModelBreakdown],
-        projectPath: String? = nil,
-        projectName: String? = nil,
-        title: String? = nil)
-    {
-        self.sessionID = sessionID
-        self.lastActivity = lastActivity
-        self.inputTokens = inputTokens
-        self.cachedInputTokens = cachedInputTokens
-        self.outputTokens = outputTokens
-        self.reasoningTokens = reasoningTokens
-        self.totalTokens = totalTokens
-        self.requestCount = requestCount
-        self.costUSD = costUSD
-        self.modelBreakdowns = modelBreakdowns
-        self.projectPath = projectPath
-        self.projectName = projectName
-        self.title = title
-    }
-
-    public func withTitle(_ title: String?) -> CostUsageSessionBreakdown {
-        var copy = self
-        copy.title = title
-        return copy
-    }
-}
-
 /// An hour-aligned bucket used by spend charts and legacy quota history.
 public struct CostUsageHourlyEntry: Sendable, Equatable {
     public let hour: Date
@@ -250,6 +188,8 @@ public struct CostUsageTokenSnapshot: Sendable, Equatable {
     /// non-reversible fingerprint, not account identity, and is not emitted by CLI payloads.
     public let credentialScopeFingerprint: String?
     public let daily: [CostUsageDailyReport.Entry]
+    /// Whether this read produced the complete project and session projection, including a confirmed empty result.
+    public let detailsAreComplete: Bool
     public let projects: [CostUsageProjectBreakdown]
     public let sessions: [CostUsageSessionBreakdown]
     /// Hour-aligned buckets for spend charts and legacy quota history.
@@ -277,6 +217,7 @@ public struct CostUsageTokenSnapshot: Sendable, Equatable {
         daily: [CostUsageDailyReport.Entry],
         projects: [CostUsageProjectBreakdown] = [],
         sessions: [CostUsageSessionBreakdown] = [],
+        detailsAreComplete: Bool = false,
         hourly: [CostUsageHourlyEntry] = [],
         quotaSlices: [CostUsageTimedEntry] = [],
         updatedAt: Date)
@@ -297,6 +238,7 @@ public struct CostUsageTokenSnapshot: Sendable, Equatable {
         self.costProvenance = costProvenance
         self.credentialScopeFingerprint = credentialScopeFingerprint
         self.daily = daily
+        self.detailsAreComplete = detailsAreComplete
         self.projects = projects
         self.sessions = sessions
         self.hourly = hourly
@@ -417,7 +359,9 @@ public struct CostUsageTokenSnapshot: Sendable, Equatable {
 public struct CostUsageProjectBreakdown: Sendable, Equatable {
     public static let unknownProjectName = "Unknown project"
 
-    public let name: String
+    public internal(set) var name: String
+    /// Explicit desktop chat ownership is display metadata, never an accounting key.
+    public internal(set) var isProjectless: Bool
     public let path: String?
     public let totalTokens: Int?
     public let totalCostUSD: Double?
@@ -432,7 +376,8 @@ public struct CostUsageProjectBreakdown: Sendable, Equatable {
         totalCostUSD: Double?,
         daily: [CostUsageDailyReport.Entry],
         modelBreakdowns: [CostUsageDailyReport.ModelBreakdown]?,
-        sources: [CostUsageProjectSourceBreakdown] = [])
+        sources: [CostUsageProjectSourceBreakdown] = [],
+        isProjectless: Bool = false)
     {
         self.name = name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? Self.unknownProjectName
@@ -444,6 +389,7 @@ public struct CostUsageProjectBreakdown: Sendable, Equatable {
         self.daily = daily
         self.modelBreakdowns = modelBreakdowns
         self.sources = sources
+        self.isProjectless = isProjectless
     }
 }
 
@@ -1174,13 +1120,11 @@ extension CostUsageDailyReport {
             for entry in report.hourly {
                 let hour = calendar.dateInterval(of: .hour, for: entry.hour)?.start ?? entry.hour
                 reportHours.insert(hour)
-                var accumulator = buckets[hour] ?? CostUsageTemporalTotals()
-                accumulator.add(
+                buckets[hour, default: CostUsageTemporalTotals()].add(
                     totalTokens: entry.totalTokens,
                     costUSD: entry.costUSD,
                     tokensAreComplete: entry.tokensAreComplete,
                     costIsComplete: entry.costIsComplete)
-                buckets[hour] = accumulator
             }
 
             // An exact-only source still contributes to the merged chart hour. This is a true
@@ -1191,23 +1135,19 @@ extension CostUsageDailyReport {
                 let hour = calendar.dateInterval(of: .hour, for: entry.timestamp)?.start
                     ?? entry.timestamp
                 guard !reportHours.contains(hour) else { continue }
-                var accumulator = exactByHour[hour] ?? CostUsageTemporalTotals()
-                accumulator.add(
+                exactByHour[hour, default: CostUsageTemporalTotals()].add(
                     totalTokens: entry.totalTokens,
                     costUSD: entry.costUSD,
                     tokensAreComplete: entry.tokensAreComplete,
                     costIsComplete: entry.costIsComplete)
-                exactByHour[hour] = accumulator
             }
             for (hour, exact) in exactByHour {
                 let entry = exact.timedEntry(timestamp: hour)
-                var accumulator = buckets[hour] ?? CostUsageTemporalTotals()
-                accumulator.add(
+                buckets[hour, default: CostUsageTemporalTotals()].add(
                     totalTokens: entry.totalTokens,
                     costUSD: entry.costUSD,
                     tokensAreComplete: entry.tokensAreComplete,
                     costIsComplete: entry.costIsComplete)
-                buckets[hour] = accumulator
             }
         }
         return buckets.keys.sorted().map { hour in
@@ -1218,18 +1158,28 @@ extension CostUsageDailyReport {
     private static func mergedQuotaSlices(
         from reports: [CostUsageDailyReport]) -> [CostUsageTimedEntry]
     {
-        let hasQuotaSlices = reports.contains { !$0.quotaSlices.isEmpty }
-        guard hasQuotaSlices else { return [] }
+        let contributors = reports.filter { !$0.quotaSlices.isEmpty }
+        guard let slices = contributors.first?.quotaSlices else { return [] }
+        if contributors.count == 1 {
+            var previousTimestamp = -Double.infinity
+            let isNormalized = slices.allSatisfy { entry in
+                let timestamp = entry.timestamp.timeIntervalSinceReferenceDate
+                defer { previousTimestamp = timestamp }
+                // Single-entry accumulation preserves nils and completeness, but changes invalid values and -0.
+                return timestamp.isFinite && timestamp > previousTimestamp
+                    && entry.totalTokens.map { $0 >= 0 } != false
+                    && entry.costUSD.map { $0.isFinite && $0.sign == .plus } != false
+            }
+            if isNormalized { return slices }
+        }
         var buckets: [Date: CostUsageTemporalTotals] = [:]
         for report in reports {
             for entry in report.quotaSlices {
-                var accumulator = buckets[entry.timestamp] ?? CostUsageTemporalTotals()
-                accumulator.add(
+                buckets[entry.timestamp, default: CostUsageTemporalTotals()].add(
                     totalTokens: entry.totalTokens,
                     costUSD: entry.costUSD,
                     tokensAreComplete: entry.tokensAreComplete,
                     costIsComplete: entry.costIsComplete)
-                buckets[entry.timestamp] = accumulator
             }
         }
         return buckets.keys.sorted().map { timestamp in
@@ -1247,9 +1197,7 @@ extension CostUsageDailyReport {
                 let rawDate = entry.date.trimmingCharacters(in: .whitespacesAndNewlines)
                 let dayKey = CostUsageTokenSnapshot.localDayKey(for: rawDate, calendar: calendar)
                     ?? rawDate
-                var accumulator = dayAccumulators[dayKey] ?? EntryAccumulator()
-                accumulator.add(entry)
-                dayAccumulators[dayKey] = accumulator
+                dayAccumulators[dayKey, default: EntryAccumulator()].add(entry)
             }
         }
 
@@ -1280,7 +1228,7 @@ extension CostUsageDailyReport {
             totalCostUSD: totals.resolvedCostUSD())
     }
 
-    private static func sortedModelBreakdowns(_ breakdowns: [ModelBreakdown]) -> [ModelBreakdown] {
+    static func sortedModelBreakdowns(_ breakdowns: [ModelBreakdown]) -> [ModelBreakdown] {
         breakdowns.sorted { lhs, rhs in
             let lhsCost = lhs.costUSD ?? -1
             let rhsCost = rhs.costUSD ?? -1

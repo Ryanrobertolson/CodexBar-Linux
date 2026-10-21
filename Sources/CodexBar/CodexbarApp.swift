@@ -154,26 +154,9 @@ protocol UpdaterProviding: AnyObject {
     var automaticallyDownloadsUpdates: Bool { get set }
     var isAvailable: Bool { get }
     var unavailableReason: String? { get }
-    var manualUpdateCommand: ManualUpdateCommand? { get }
     var updateStatus: UpdateStatus { get }
     func checkForUpdates(_ sender: Any?)
     func installUpdate()
-}
-
-extension UpdaterProviding {
-    var manualUpdateCommand: ManualUpdateCommand? {
-        nil
-    }
-}
-
-enum ManualUpdateCommand: Sendable {
-    case homebrew
-
-    var command: String {
-        switch self {
-        case .homebrew: "brew upgrade --cask steipete/tap/codexbar"
-        }
-    }
 }
 
 /// No-op updater used for debug builds and non-bundled runs to suppress Sparkle dialogs.
@@ -182,12 +165,10 @@ final class DisabledUpdaterController: UpdaterProviding {
     var automaticallyDownloadsUpdates: Bool = false
     let isAvailable: Bool = false
     let unavailableReason: String?
-    let manualUpdateCommand: ManualUpdateCommand?
     let updateStatus = UpdateStatus()
 
-    init(unavailableReason: String? = nil, manualUpdateCommand: ManualUpdateCommand? = nil) {
+    init(unavailableReason: String? = nil) {
         self.unavailableReason = unavailableReason
-        self.manualUpdateCommand = manualUpdateCommand
     }
 
     func checkForUpdates(_ sender: Any?) {}
@@ -197,30 +178,25 @@ final class DisabledUpdaterController: UpdaterProviding {
 @MainActor
 @Observable
 final class UpdateStatus {
-    static let disabled = UpdateStatus()
-    var isUpdateReady: Bool
+    var isUpdateReady = false
     /// A newer version that can be installed on demand, for updaters that do not stage downloads.
     var availableVersion: String?
-    var isInstalling: Bool
-
-    init(isUpdateReady: Bool = false, availableVersion: String? = nil, isInstalling: Bool = false) {
-        self.isUpdateReady = isUpdateReady
-        self.availableVersion = availableVersion
-        self.isInstalling = isInstalling
-    }
+    var isInstalling = false
 }
 
 #if canImport(Sparkle) && ENABLE_SPARKLE
 import Sparkle
 
 @MainActor
-final class SparkleUpdaterController: NSObject, UpdaterProviding, SPUUpdaterDelegate {
+final class SparkleUpdaterController: NSObject, UpdaterProviding, SPUUpdaterDelegate,
+    SPUStandardUserDriverDelegate
+{
     private static let presentationTimeout: Duration = .seconds(60)
 
     private lazy var controller = SPUStandardUpdaterController(
         startingUpdater: false,
         updaterDelegate: self,
-        userDriverDelegate: nil)
+        userDriverDelegate: self)
     let updateStatus = UpdateStatus()
     let unavailableReason: String? = nil
     let isAvailable = true
@@ -321,6 +297,22 @@ final class SparkleUpdaterController: NSObject, UpdaterProviding, SPUUpdaterDele
         }
     }
 
+    /// Scheduled alerts can appear without key, main, or occlusion notifications.
+    nonisolated func standardUserDriverWillHandleShowingUpdate(
+        _ handleShowingUpdate: Bool,
+        forUpdate _: SUAppcastItem,
+        state: SPUUserUpdateState)
+    {
+        guard handleShowingUpdate, !state.userInitiated else { return }
+        Task { @MainActor in
+            if self.dockPresentationAttemptID == nil {
+                self.dockPresentationAttemptID = DockIconController.shared.promote(
+                    presentationTimeout: Self.presentationTimeout)
+            }
+            DockIconController.shared.windowsMayHaveChanged()
+        }
+    }
+
     nonisolated func allowedChannels(for updater: SPUUpdater) -> Set<String> {
         UpdateChannel.current.allowedSparkleChannels
     }
@@ -349,7 +341,8 @@ private func makeUpdaterController() -> UpdaterProviding {
 
     if InstallOrigin.isHomebrewCask(appBundleURL: bundleURL) {
         return HomebrewUpdaterController(
-            savedAutoCheck: (UserDefaults.standard.object(forKey: "autoUpdateEnabled") as? Bool) ?? true)
+            savedAutoCheck: (UserDefaults.standard.object(forKey: "autoUpdateEnabled") as? Bool) ?? true,
+            notifier: HomebrewUpdateNotifier(dependencies: .live))
     }
 
     guard isDeveloperIDSigned(bundleURL: bundleURL) else {
@@ -398,17 +391,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var codexAccountPromotionCoordinator: CodexAccountPromotionCoordinator?
     private var cloudSyncCoordinator: CloudSyncCoordinator?
     private var settingsWindowController: SettingsWindowController?
+    private var pendingUpdateSettingsOpen = false
     private lazy var placeholderSettingsWindowGuard = PlaceholderSettingsWindowGuard(
         isKnownSettingsWindow: { [weak self] window in
             self?.settingsWindowController?.window === window
         })
     private var hasInstalledLimitResetObservers = false
+    private var isWaitingForConfigPersistence = false
     #if DEBUG
     private var debugMemoryPressureObserver: NSObjectProtocol?
     #endif
     var terminateActiveProcessesForAppShutdown: () -> Void = {
         TTYCommandRunner.terminateActiveProcessesForAppShutdown()
     }
+
+    var replyToApplicationShouldTerminate: (NSApplication, Bool) -> Void = { application, shouldTerminate in
+        application.reply(toApplicationShouldTerminate: shouldTerminate)
+    }
+
+    #if DEBUG
+    func _test_configureSettings(_ settings: SettingsStore) {
+        self.settings = settings
+    }
+    #endif
 
     func configure(_ dependencies: Dependencies) {
         self.store = dependencies.store
@@ -430,10 +435,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else { return }
                 await self.runProviderLoginFlow(provider)
             })
+        if self.pendingUpdateSettingsOpen {
+            self.pendingUpdateSettingsOpen = false
+            self.openSettings(pane: .about)
+        }
     }
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         MenuBarStatusItemWindowProbe.trace("will-finish-launching")
+        AppNotifications.shared.configureUpdateAction { [weak self] in
+            guard let self else { return }
+            if self.settingsWindowController == nil {
+                self.pendingUpdateSettingsOpen = true
+            } else {
+                self.openSettings(pane: .about)
+            }
+        }
         self.configureAppIconForMacOSVersion()
         // The SwiftUI `Settings` scene is an empty placeholder; macOS otherwise presents it at launch.
         self.placeholderSettingsWindowGuard.start()
@@ -446,18 +463,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         MenuBarStatusItemWindowProbe.trace("did-finish-launching")
+        WidgetExtensionRecovery.launch(reload: UsageStore.reloadWidgetTimelines)
         self.dockIconController.start()
         self.memoryPressureMonitor.start()
         #if DEBUG
         self.installDebugMemoryPressureObserverIfNeeded()
         #endif
         self.ensureStatusController()
-        self.closeSwiftUISettingsPlaceholderWindow()
         self.observeSettingsApplicationMenuLanguage()
         self.scheduleSettingsApplicationMenuValidation(
             missingItemRetriesRemaining: Self.settingsMenuReadinessRetryCount,
             fallbackVerificationRetriesRemaining: Self.settingsMenuFallbackVerificationRetryCount)
         self.cloudSyncCoordinator?.start()
+        Task { await self.settings?.httpServer.startSaved() }
         Task { @MainActor [weak self] in
             await Task.yield()
             guard let settings = self?.settings else { return }
@@ -492,19 +510,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// The SwiftUI `Settings` scene exists only to own the app-menu Settings command; the real
-    /// settings window is AppKit-managed (`SettingsWindowController`). macOS can still present or
-    /// state-restore the scene's empty placeholder window at launch — close it and keep it out of
-    /// state restoration so it cannot come back on the next launch.
-    private func closeSwiftUISettingsPlaceholderWindow() {
-        DispatchQueue.main.async {
-            for window in NSApp.windows
-                where window.identifier?.rawValue.hasPrefix("com_apple_SwiftUI_Settings") == true
-            {
-                window.isRestorable = false
-                window.close()
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !self.isWaitingForConfigPersistence else { return .terminateLater }
+        let serverStop = self.settings?.httpServer.stopForTermination()
+        let save = self.settings?.persistPendingConfigForTermination()
+        guard save != nil || serverStop != nil else { return .terminateNow }
+        self.isWaitingForConfigPersistence = true
+        Task.detached {
+            await save?.value
+            await serverStop?.value
+            // NSApplication may be inside a modal loop entered from the main dispatch queue.
+            // A MainActor task cannot reliably resume there; deliver the reply on that run loop.
+            RunLoop.main.perform(inModes: [.default, .modalPanel]) {
+                MainActor.assumeIsolated {
+                    self.isWaitingForConfigPersistence = false
+                    self.replyToApplicationShouldTerminate(sender, true)
+                }
             }
+            CFRunLoopWakeUp(CFRunLoopGetMain())
         }
+        return .terminateLater
     }
 
     func applicationWillTerminate(_ notification: Notification) {

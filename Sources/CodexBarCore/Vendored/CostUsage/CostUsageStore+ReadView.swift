@@ -150,23 +150,43 @@ struct CostUsageStoreReadView: Sendable {
         CostUsageScanner.buildCodexReportFromCache(cache: self.cache, range: range, modelsDevCacheRoot: cacheRoot)
     }
 
-    func projects(range: CostUsageScanner.CostUsageDayRange, cacheRoot: URL?) -> [CostUsageProjectBreakdown] {
-        CostUsageScanner.buildCodexProjectBreakdownsFromCache(
-            cache: self.cache, range: range, modelsDevCacheRoot: cacheRoot)
-    }
-
-    func sessions(
+    func reports(
         range: CostUsageScanner.CostUsageDayRange,
         cacheRoot: URL?,
-        roots: [URL]) -> [CostUsageSessionBreakdown]
+        roots: [URL],
+        includeBreakdowns: Bool = true,
+        includeProjects: Bool = true)
+        -> (daily: CostUsageDailyReport, projects: [CostUsageProjectBreakdown], sessions: [CostUsageSessionBreakdown])
     {
-        CostUsageScanner.buildCodexSessionBreakdownsFromCache(
-            cache: self.cache, range: range, modelsDevCacheRoot: cacheRoot, sessionRoots: roots)
+        CostUsageScanner.buildCodexReportProjectionsFromCache(
+            cache: self.cache,
+            range: range,
+            modelsDevCacheRoot: cacheRoot,
+            sessionRoots: roots,
+            includeBreakdowns: includeBreakdowns,
+            includeProjects: includeProjects)
+    }
+
+    func projectSessionIDs(range: CostUsageScanner.CostUsageDayRange) -> [String: Set<String>] {
+        // Session rows deduplicate to the latest file. Ownership must include older files too,
+        // even after a thread moves directories. This conservative superset is refresh-only.
+        var sessionIDsByPath: [String: Set<String>] = [:]
+        for (filePath, usage) in self.cache.files {
+            guard let path = usage.projectPath,
+                  usage.touchesCodexScanWindow(
+                      sinceKey: range.scanSinceKey,
+                      untilKey: range.scanUntilKey,
+                      calendar: range.calendar) else { continue }
+            let id = usage.sessionId ?? URL(fileURLWithPath: filePath).deletingPathExtension().lastPathComponent
+            sessionIDsByPath[path, default: []].insert(id)
+        }
+        return sessionIDsByPath
     }
 
     func catchUpStatus(
         roots: [URL],
-        rootsFingerprint: [String: Int64]) -> CostUsageFetcher.CodexScanCatchUpStatus
+        rootsFingerprint: [String: Int64],
+        requiredRange: CostUsageScanner.CostUsageDayRange? = nil) -> CostUsageFetcher.CodexScanCatchUpStatus
     {
         guard self.roots == rootsFingerprint else {
             return .init(pending: false, progressKey: "scope-mismatch")
@@ -180,7 +200,10 @@ struct CostUsageStoreReadView: Sendable {
             totalBytes: self.cache.codexScanTotalBytes ?? 0,
             completedFiles: self.cache.codexScanCompletedFiles ?? 0,
             totalFiles: self.cache.codexScanTotalFiles ?? 0,
-            staleSnapshotUpdatedAt: pending ? self.cache.codexPreviousReport?.updatedAt : nil)
+            staleSnapshotUpdatedAt: pending ? self.cache.codexPreviousReport?.updatedAt : nil,
+            completionIsConfirmed: !pending && requiredRange.map {
+                self.historyCoverageIsEstablished(range: $0, rootsFingerprint: rootsFingerprint)
+            } == true)
     }
 }
 

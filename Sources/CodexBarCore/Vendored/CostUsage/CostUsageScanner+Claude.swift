@@ -109,26 +109,6 @@ extension CostUsageScanner {
             workingDirectory: workingDirectory)
     }
 
-    static func parseClaudeFile(
-        fileURL: URL,
-        range: CostUsageDayRange,
-        providerFilter: ClaudeLogProviderFilter,
-        startOffset: Int64 = 0,
-        modelsDevCatalog: ModelsDevCatalog? = nil,
-        modelsDevCacheRoot: URL? = nil) -> ClaudeParseResult
-    {
-        let pricingResolver = modelsDevCatalog.map { CostUsagePricing.ClaudeResolver(catalog: $0) }
-            ?? CostUsagePricing.ClaudeResolver(now: Date(), cacheRoot: modelsDevCacheRoot)
-        return (
-            try? self.parseClaudeFileCancellable(
-                fileURL: fileURL,
-                range: range,
-                providerFilter: providerFilter,
-                startOffset: startOffset,
-                pricingResolver: pricingResolver,
-                checkCancellation: nil)) ?? ClaudeParseResult(rows: [], parsedBytes: startOffset)
-    }
-
     static func parseClaudeFileCancellable(
         fileURL: URL,
         range: CostUsageDayRange,
@@ -138,22 +118,14 @@ extension CostUsageScanner {
         checkCancellation: CancellationCheck? = nil) throws -> ClaudeParseResult
     {
         func toInt(_ v: Any?) -> Int {
-            if let n = v as? NSNumber {
-                return n.intValue
-            }
-            return 0
+            (v as? NSNumber)?.intValue ?? 0
         }
 
         func toBool(_ value: Any?) -> Bool {
-            if let bool = value as? Bool {
-                return bool
-            }
-            if let number = value as? NSNumber {
-                return number.boolValue
-            }
-            return false
+            (value as? Bool) ?? (value as? NSNumber)?.boolValue ?? false
         }
 
+        let rowStrings = CostUsageRowStringPool()
         let pathRole = Self.claudePathRole(fileURL: fileURL)
         var keyedRows: [ClaudeRowKey: ClaudeUsageRow] = [:]
         var unkeyedRows: [ClaudeUsageRow] = []
@@ -250,8 +222,8 @@ extension CostUsageScanner {
                         let normalizedModel = pricingResolver.normalize(model)
                         let row = ClaudeUsageRow(
                             dayKey: dayKey,
-                            model: normalizedModel,
-                            sessionId: sessionId,
+                            model: rowStrings.intern(normalizedModel),
+                            sessionId: sessionId.map(rowStrings.intern),
                             messageId: messageId,
                             requestId: requestId,
                             timestampUnixMs: Int64((timestamp.timeIntervalSince1970 * 1000).rounded()),
@@ -282,7 +254,7 @@ extension CostUsageScanner {
             parsedBytes = startOffset
         }
 
-        let rows = keyedRows.keys.sorted().compactMap { keyedRows[$0] } + unkeyedRows
+        let rows = Self.orderedClaudeRows(keyed: keyedRows, unkeyed: unkeyedRows)
         return ClaudeParseResult(rows: rows, parsedBytes: parsedBytes)
     }
 
@@ -334,7 +306,20 @@ extension CostUsageScanner {
             }
         }
 
-        return keyedRows.keys.sorted().compactMap { keyedRows[$0] } + unkeyedRows
+        return Self.orderedClaudeRows(keyed: keyedRows, unkeyed: unkeyedRows)
+    }
+
+    private static func orderedClaudeRows(
+        keyed: [ClaudeRowKey: ClaudeUsageRow],
+        unkeyed: [ClaudeUsageRow]) -> [ClaudeUsageRow]
+    {
+        var rows: [ClaudeUsageRow] = []
+        rows.reserveCapacity(keyed.count + unkeyed.count)
+        for key in keyed.keys.sorted() {
+            if let row = keyed[key] { rows.append(row) }
+        }
+        rows.append(contentsOf: unkeyed)
+        return rows
     }
 
     private static func claudeRowWins(
@@ -353,32 +338,48 @@ extension CostUsageScanner {
         return lhs.path < rhs.path
     }
 
+    private typealias ClaudeRowReference = (file: Int, row: Int)
+
+    #if DEBUG
+    static var claudeWinnerPayloadStride: Int {
+        MemoryLayout<ClaudeRowReference>.stride
+    }
+    #endif
+
     static func reconciledClaudeRows(cache: CostUsageCache) -> [ClaudeUsageRow] {
         #if DEBUG
         recordClaudeScanWork(.reconcile)
         #endif
         var rows: [ClaudeUsageRow] = []
-        var winners: [ClaudeRowKey: (path: String, row: ClaudeUsageRow)] = [:]
+        var winners: [ClaudeRowKey: ClaudeRowReference] = [:]
+        // These immutable array references keep winner indexes stable without copying their row buffers.
+        let files: [(path: String, rows: [ClaudeUsageRow])] = cache.files.keys.sorted().compactMap { path in
+            guard let fileRows = cache.files[path]?.claudeRows else { return nil }
+            return (path, fileRows)
+        }
 
-        for path in cache.files.keys.sorted() {
-            guard let fileRows = cache.files[path]?.claudeRows else { continue }
-            for row in fileRows {
+        for (fileIndex, file) in files.enumerated() {
+            for (rowIndex, row) in file.rows.enumerated() {
                 guard let canonicalKey = Self.claudeCanonicalRowKey(row) else {
                     rows.append(row)
                     continue
                 }
-                let candidate = (path: path, row: row)
-                if let existing = winners[canonicalKey] {
-                    if Self.claudeRowWins(lhs: candidate, rhs: existing) {
-                        winners[canonicalKey] = candidate
-                    }
-                } else {
-                    winners[canonicalKey] = candidate
+                if let existing = winners[canonicalKey],
+                   !Self.claudeRowWins(
+                       lhs: (path: file.path, row: row),
+                       rhs: (path: files[existing.file].path, row: files[existing.file].rows[existing.row]))
+                {
+                    continue
                 }
+                winners[canonicalKey] = (fileIndex, rowIndex)
             }
         }
 
-        rows.append(contentsOf: winners.keys.sorted().compactMap { winners[$0]?.row })
+        rows.reserveCapacity(rows.count + winners.count)
+        for key in winners.keys.sorted() {
+            guard let winner = winners[key] else { continue }
+            rows.append(files[winner.file].rows[winner.row])
+        }
         return rows
     }
 
@@ -559,6 +560,16 @@ extension CostUsageScanner {
         return lower.contains("vertex") || (includeGCP && lower.contains("gcp"))
     }
 
+    private static func claudeRootExists(atPath path: String) throws -> Bool {
+        var info = stat()
+        guard path.withCString({ fstatat(AT_FDCWD, $0, &info, 0) }) == 0 else {
+            let code = errno
+            if code == ENOENT || code == ENOTDIR { return false }
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(code), userInfo: [NSFilePathErrorKey: path])
+        }
+        return true
+    }
+
     private static func claudeRootCandidates(for rootPath: String) -> [String] {
         if rootPath.hasPrefix("/var/") {
             return ["/private" + rootPath, rootPath]
@@ -568,19 +579,6 @@ extension CostUsageScanner {
             return [rootPath, trimmed]
         }
         return [rootPath]
-    }
-
-    private struct ClaudeSourceFile {
-        let url: URL
-        let stamp: CostUsageClaudeFileStamp
-    }
-
-    private struct ClaudeSourceInventory {
-        var files: [String: ClaudeSourceFile] = [:]
-
-        var stamps: [String: CostUsageClaudeFileStamp] {
-            self.files.mapValues(\.stamp)
-        }
     }
 
     private struct ClaudeScanState {
@@ -595,12 +593,11 @@ extension CostUsageScanner {
     }
 
     private static func processClaudeFile(
-        source: ClaudeSourceFile,
+        path: String,
+        stamp: CostUsageClaudeFileStamp,
         state: inout ClaudeScanState) throws
     {
         try state.checkCancellation?()
-        let path = source.url.path
-        let stamp = source.stamp
         let cached = state.cache.files[path]
         let sameFile = state.sourceFileIDs[path] == stamp.fileID
 
@@ -628,7 +625,7 @@ extension CostUsageScanner {
         Self.recordClaudeScanWork(.transcriptParse(startOffset: startOffset))
         #endif
         let parsed = try Self.parseClaudeFileCancellable(
-            fileURL: source.url,
+            fileURL: URL(fileURLWithPath: path),
             range: state.range,
             providerFilter: state.providerFilter,
             startOffset: startOffset,
@@ -636,11 +633,12 @@ extension CostUsageScanner {
             checkCancellation: state.checkCancellation)
         let rows = startOffset > 0 ? Self.mergeClaudeRows(existing: cached?.claudeRows ?? [], delta: parsed.rows)
             : parsed.rows
-        let usage = Self.makeFileUsage(
+        let usage = CostUsageFileUsage(
             mtimeUnixMs: stamp.mtimeUnixMs,
             size: stamp.size,
             days: [:],
             parsedBytes: parsed.parsedBytes,
+            codexCostCacheComplete: true,
             claudeRows: rows)
         state.cache.files[path] = usage
         state.sourceFileIDs[path] = stamp.fileID
@@ -648,29 +646,50 @@ extension CostUsageScanner {
 
     private static func inventoryClaudeRoots(
         _ roots: [URL],
-        checkCancellation: CancellationCheck?) throws -> ClaudeSourceInventory
+        checkCancellation: CancellationCheck?) throws -> [String: CostUsageClaudeFileStamp]
     {
-        var inventory = ClaudeSourceInventory()
+        var inventory: [String: CostUsageClaudeFileStamp] = [:]
 
         for root in roots {
             try checkCancellation?()
             let rootPath = root.path
             let rootCandidates = Self.claudeRootCandidates(for: rootPath)
-            guard let existingRootPath = rootCandidates.first(where: { FileManager.default.fileExists(atPath: $0) })
+            // A root that exists but cannot be inspected must fail the scan, not silently drop its sources.
+            guard let existingRootPath = try rootCandidates.first(where: { try Self.claudeRootExists(atPath: $0) })
             else { continue }
             let existingRoot = existingRootPath == rootPath ? root : URL(fileURLWithPath: existingRootPath)
+            if existingRoot.pathExtension == "jsonl",
+               let stamp = try CostUsageClaudeFileStamp.readIfPresent(at: existingRoot)
+            {
+                inventory[existingRoot.path] = stamp
+                continue
+            }
+            var enumerationError: Error?
             guard let enumerator = FileManager.default.enumerator(
                 at: existingRoot,
                 includingPropertiesForKeys: nil,
-                options: [.skipsHiddenFiles, .skipsPackageDescendants])
-            else { continue }
+                options: [.skipsHiddenFiles, .skipsPackageDescendants],
+                errorHandler: { _, error in
+                    // Files removed mid-walk are ordinary churn; unreadable directories would undercount.
+                    if CostUsageClaudeFileStamp.isMissingFileError(error) { return true }
+                    enumerationError = error
+                    return false
+                })
+            else {
+                guard try Self.claudeRootExists(atPath: existingRootPath) else { continue }
+                throw NSError(
+                    domain: NSCocoaErrorDomain,
+                    code: NSFileReadUnknownError,
+                    userInfo: [NSFilePathErrorKey: existingRootPath])
+            }
 
             for case let url as URL in enumerator {
                 try checkCancellation?()
                 guard url.pathExtension.lowercased() == "jsonl" else { continue }
-                guard let stamp = CostUsageClaudeFileStamp.read(at: url), stamp.size > 0 else { continue }
-                inventory.files[url.path] = ClaudeSourceFile(url: url, stamp: stamp)
+                guard let stamp = try CostUsageClaudeFileStamp.readIfPresent(at: url), stamp.size > 0 else { continue }
+                inventory[url.path] = stamp
             }
+            if let enumerationError { throw enumerationError }
         }
         return inventory
     }
@@ -684,7 +703,7 @@ extension CostUsageScanner {
         checkCancellation: CancellationCheck?) throws -> CostUsageDailyReport
     {
         let roots = self.defaultClaudeProjectsRoots(options: options)
-        let inventory = try Self.inventoryClaudeRoots(roots, checkCancellation: checkCancellation)
+        let sourceInventory = try Self.inventoryClaudeRoots(roots, checkCancellation: checkCancellation)
         try checkCancellation?()
 
         let cacheContext = reportContext ?? .regular
@@ -696,7 +715,7 @@ extension CostUsageScanner {
         let cacheArtifactStamp = CostUsageClaudeFileStamp.read(at: cacheURL)
         let pricingURL = ModelsDevCache.cacheFileURL(cacheRoot: options.cacheRoot)
         let pricingArtifactStamp = CostUsageClaudeFileStamp.read(at: pricingURL)
-        let reportKey = Self.claudeReportMemoKey(
+        var reportKey = Self.claudeReportMemoKey(
             provider: provider,
             providerFilter: options.claudeLogProviderFilter,
             range: range,
@@ -704,7 +723,6 @@ extension CostUsageScanner {
             artifactStamps: (cache: cacheArtifactStamp, pricing: pricingArtifactStamp))
         let memo = CostUsageClaudeReportMemo.shared
         let priorMemo = memo.entry(provider: provider, canonicalCachePath: canonicalCachePath)
-        let sourceInventory = inventory.stamps
 
         if !options.forceRescan,
            let priorMemo,
@@ -760,7 +778,7 @@ extension CostUsageScanner {
                 artifact.sourceFileIDs = [:]
             }
             let changedPaths: Set<String> = if let priorMemo {
-                Set(inventory.files.keys.filter { path in
+                Set(sourceInventory.keys.filter { path in
                     priorMemo.sourceInventory[path] != sourceInventory[path]
                 })
             } else {
@@ -776,9 +794,9 @@ extension CostUsageScanner {
                 pricingResolver: pricingResolver,
                 checkCancellation: checkCancellation)
 
-            for path in inventory.files.keys.sorted() {
-                guard let source = inventory.files[path] else { continue }
-                try Self.processClaudeFile(source: source, state: &scanState)
+            for path in sourceInventory.keys.sorted() {
+                guard let stamp = sourceInventory[path] else { continue }
+                try Self.processClaudeFile(path: path, stamp: stamp, state: &scanState)
             }
             try checkCancellation?()
 
@@ -825,24 +843,20 @@ extension CostUsageScanner {
         }
 
         let finalCacheArtifactStamp = CostUsageClaudeFileStamp.read(at: cacheURL)
-        let finalPricingArtifactStamp = CostUsageClaudeFileStamp.read(at: pricingURL)
-        let finalReportKey = Self.claudeReportMemoKey(
-            provider: provider,
-            providerFilter: providerFilter,
-            range: range,
-            roots: roots,
-            artifactStamps: (cache: finalCacheArtifactStamp, pricing: finalPricingArtifactStamp))
         let cacheArtifactIsCurrent = if shouldMutateCache {
             committedCacheStamp != nil && finalCacheArtifactStamp == committedCacheStamp
         } else {
             finalCacheArtifactStamp == cacheArtifactStamp
         }
-        if cacheArtifactIsCurrent, finalPricingArtifactStamp == pricingArtifactStamp {
+        if cacheArtifactIsCurrent {
+            // Keep the window certificate even if pricing was replaced during this pass.
+            // The earlier pricing stamp makes report reuse miss and reprice cached rows.
+            reportKey.cacheArtifactStamp = finalCacheArtifactStamp
             memo.store(
                 provider: provider,
                 canonicalCachePath: canonicalCachePath,
                 sourceInventory: sourceInventory,
-                reportKey: finalReportKey,
+                reportKey: reportKey,
                 report: report,
                 hasWindowScopedRows: hasWindowScopedBaseline || (shouldMutateCache && forceFullScan))
         }
@@ -876,19 +890,6 @@ extension CostUsageScanner {
     }
 
     static func buildClaudeReportFromCache(
-        cache: CostUsageCache,
-        range: CostUsageDayRange,
-        now: Date = Date(),
-        modelsDevCacheRoot: URL? = nil) -> CostUsageDailyReport
-    {
-        self.buildClaudeReportFromCache(
-            cache: cache,
-            rows: self.reconciledClaudeRows(cache: cache),
-            range: range,
-            pricingResolver: CostUsagePricing.ClaudeResolver(now: now, cacheRoot: modelsDevCacheRoot))
-    }
-
-    private static func buildClaudeReportFromCache(
         cache: CostUsageCache,
         rows: [ClaudeUsageRow],
         range: CostUsageDayRange,

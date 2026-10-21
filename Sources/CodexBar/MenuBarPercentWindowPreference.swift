@@ -3,15 +3,19 @@ import Foundation
 
 /// Maps the layout's common top-level percentage tokens onto one picker. Conditional branches
 /// and direct primary/secondary lane tokens remain under the layout editor's control.
-enum MenuBarPercentWindowPreference: String, CaseIterable, Identifiable, Sendable {
+enum MenuBarPercentWindowPreference: Hashable, Identifiable, Sendable {
     case automatic
     case session
     case weekly
     case tertiary
     case monthlyPlan
+    case extra(id: String)
+
+    static let standardChoices: [Self] = [.automatic, .session, .weekly, .tertiary, .monthlyPlan]
 
     var id: String {
-        self.rawValue
+        if case let .extra(id) = self { return "extra:\(id)" }
+        return String(describing: self)
     }
 
     private var percentWindow: PercentWindow? {
@@ -19,12 +23,13 @@ enum MenuBarPercentWindowPreference: String, CaseIterable, Identifiable, Sendabl
         case .automatic: .automatic
         case .session: .session
         case .weekly: .weekly
-        case .tertiary, .monthlyPlan: nil
+        case .tertiary, .monthlyPlan, .extra: nil
         }
     }
 
     private var layoutToken: MenuBarLayoutToken {
         if self == .tertiary { return .lanePercent(lane: .tertiary) }
+        if case let .extra(id) = self { return .extraPercent(id: id) }
         // Metric-backed choices resolve through the automatic lane.
         return .percent(window: self.percentWindow ?? .automatic)
     }
@@ -35,18 +40,20 @@ enum MenuBarPercentWindowPreference: String, CaseIterable, Identifiable, Sendabl
         self == .monthlyPlan ? .monthlyPlan : .automatic
     }
 
-    func label(for provider: UsageProvider) -> String {
+    func label(for provider: UsageProvider, snapshot: UsageSnapshot? = nil) -> String {
+        let descriptor = ProviderDescriptorRegistry.descriptor(for: provider)
+        if case let .extra(id) = self { return descriptor.menuBarMetrics.namedExtras[id].map(L) ?? L("Usage") }
         guard self != .automatic else { return L("menu_bar_layout_token_auto") }
         if self == .monthlyPlan { return MenuBarMetricPreference.monthlyPlan.label }
         if self == .tertiary {
-            return MenuBarLayoutLaneLabels(provider: provider, snapshot: nil).label(for: .tertiary)
+            return MenuBarLayoutLaneLabels(provider: provider, snapshot: snapshot).label(for: .tertiary)
         }
-        let descriptor = ProviderDescriptorRegistry.descriptor(for: provider)
         let primary = PercentWindow.forSemanticWindow(descriptor.presentation.primarySemanticWindow)
         let presentation = descriptor.presentation
-        return L(self.percentWindow == primary
-            ? presentation.menuBarLayoutPrimaryLabel ?? descriptor.metadata.sessionLabel
-            : presentation.menuBarLayoutSecondaryLabel ?? descriptor.metadata.weeklyLabel)
+        let labels = MenuBarLayoutLaneLabels(provider: provider, snapshot: snapshot)
+        return self.percentWindow == primary
+            ? presentation.menuBarLayoutPrimaryLabel.map(L) ?? labels.primary
+            : presentation.menuBarLayoutSecondaryLabel.map(L) ?? labels.secondary
     }
 
     /// Semantic windows keep their existing mapping; an independently selectable tertiary pool
@@ -63,7 +70,7 @@ enum MenuBarPercentWindowPreference: String, CaseIterable, Identifiable, Sendabl
                 primarySemanticWindow: primarySemanticWindow,
                 secondarySemanticWindow: secondarySemanticWindow))
         }
-        var options = Self.allCases.filter { preference in
+        var options = Self.standardChoices.filter { preference in
             guard let window = preference.percentWindow else { return false }
             return windows.contains(window)
         }
@@ -73,17 +80,24 @@ enum MenuBarPercentWindowPreference: String, CaseIterable, Identifiable, Sendabl
         if metrics.supported.contains(.monthlyPlan) {
             options.append(.monthlyPlan)
         }
-        return options
+        return options + metrics.namedExtras.keys.sorted().map { .extra(id: $0) }
     }
 
     static func available(for provider: UsageProvider, layout: MenuBarLayout? = nil) -> [Self] {
         let descriptor = ProviderDescriptorRegistry.descriptor(for: provider)
-        let options = Self.available(
+        var options = Self.available(
             metrics: descriptor.menuBarMetrics,
             primarySemanticWindow: descriptor.presentation.primarySemanticWindow,
             secondarySemanticWindow: descriptor.presentation.secondarySemanticWindow)
         if let layout, !self.percentWindows(in: layout).isEmpty, self.hasTertiaryPercent(in: layout) {
-            return options.filter { $0 != .tertiary }
+            options.removeAll { $0 == .tertiary }
+        }
+        if let layout, self.hasIndependentPercents(in: layout) {
+            if self.percentWindows(in: layout).isEmpty, !self.hasTertiaryPercent(in: layout) { return [] }
+            options.removeAll { preference in
+                if case .extra = preference { return true }
+                return false
+            }
         }
         // Without a percentage in the layout, only the stored metric can change.
         if let layout, options.contains(.monthlyPlan), !self.hasPercentToken(in: layout) {
@@ -123,27 +137,38 @@ enum MenuBarPercentWindowPreference: String, CaseIterable, Identifiable, Sendabl
         let windows = Self.percentWindows(in: layout)
         guard let first = windows.first else {
             if self.hasTertiaryPercent(in: layout) { return .tertiary }
+            let extras = self.extraIDs(in: layout)
+            if let id = extras.first {
+                return extras.allSatisfy { $0 == id } ? .extra(id: id) : nil
+            }
             guard let metric else { return nil }
             return metric == .monthlyPlan ? .monthlyPlan : .automatic
         }
         guard windows.allSatisfy({ $0 == first }) else { return nil }
         if first == .automatic, metric == .monthlyPlan { return .monthlyPlan }
-        return Self.allCases.first { $0.percentWindow == first }
+        return Self.standardChoices.first { $0.percentWindow == first }
     }
 
     static func hasPercentToken(in layout: MenuBarLayout) -> Bool {
         !self.percentWindows(in: layout).isEmpty || self.hasTertiaryPercent(in: layout)
+            || !self.extraIDs(in: layout).isEmpty
     }
 
     /// Changes only the common percentage group, preserving pace, resets and custom tokens.
     func applied(to layout: MenuBarLayout) -> MenuBarLayout {
         let hasOrdinaryPercent = !Self.percentWindows(in: layout).isEmpty
+        let hasTertiary = Self.hasTertiaryPercent(in: layout)
         // Collapsing an ordinary percent and an independent tertiary token would lose their identities.
-        if self == .tertiary, hasOrdinaryPercent, Self.hasTertiaryPercent(in: layout) { return layout }
+        if self == .tertiary, hasOrdinaryPercent, hasTertiary { return layout }
+        if Self.hasIndependentPercents(in: layout) {
+            if !hasOrdinaryPercent, !hasTertiary { return layout }
+            if case .extra = self { return layout }
+        }
         return MenuBarLayout(lines: layout.lines.map { line in
             line.map { token in
-                if case .percent = token { return self.layoutToken }
+                if case let .percent(window) = token, window != .spend { return self.layoutToken }
                 if !hasOrdinaryPercent, token == .lanePercent(lane: .tertiary) { return self.layoutToken }
+                if !hasOrdinaryPercent, !hasTertiary, case .extraPercent = token { return self.layoutToken }
                 return token
             }
         })
@@ -153,9 +178,23 @@ enum MenuBarPercentWindowPreference: String, CaseIterable, Identifiable, Sendabl
         layout.lines.joined().contains(.lanePercent(lane: .tertiary))
     }
 
+    private static func hasIndependentPercents(in layout: MenuBarLayout) -> Bool {
+        let groups = (self.percentWindows(in: layout).isEmpty ? 0 : 1)
+            + (self.hasTertiaryPercent(in: layout) ? 1 : 0) + Set(self.extraIDs(in: layout)).count
+        return groups > 1
+    }
+
+    private static func extraIDs(in layout: MenuBarLayout) -> [String] {
+        layout.lines.joined().compactMap { token in
+            guard case let .extraPercent(id) = token else { return nil }
+            return id
+        }
+    }
+
     private static func percentWindows(in layout: MenuBarLayout) -> [PercentWindow] {
         layout.lines.flatMap(\.self).compactMap { token in
-            guard case let .percent(window) = token else { return nil }
+            // Spend % is a provider budget, not a quota window: the picker never selects, rewrites or removes it.
+            guard case let .percent(window) = token, window != .spend else { return nil }
             return window
         }
     }

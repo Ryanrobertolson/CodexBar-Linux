@@ -3,13 +3,36 @@ import CryptoKit
 import Foundation
 
 extension UsageStore {
+    func widgetAccountOverflowCounts() -> [String: Int] {
+        guard self.settings.accountWidgetsEnabled else { return [:] }
+        var counts: [String: Int] = [:]
+        for provider in self.enabledProviders().compactMap(\.firstPartyProvider).filter(Self.supportsWidgetUsage) {
+            let count: Int
+            // Match the account writer's source precedence without expanding its refresh or identity budget.
+            // Provider-specific by design: Claude Swap owns its inventory when it supplies account snapshots.
+            if provider == .claude, self.settings.claudeSwapEnabled, !self.claudeSwapAccountSnapshots.isEmpty {
+                count = self.claudeSwapAccountSnapshots.count
+            } else if provider == .codex {
+                // Provider-specific by design: Codex publishes the reconciled visible account inventory.
+                count = self.settings.codexVisibleAccountProjectionForMenuDisplay?.visibleAccounts.count ?? 0
+            } else if self.settings.effectiveSelectedTokenAccount(for: provider) != nil {
+                count = self.settings.tokenAccounts(for: provider).count
+            } else {
+                continue
+            }
+            let overflow = count - Self.tokenAccountMenuSnapshotLimit
+            if overflow > 0 { counts[provider.rawValue] = overflow }
+        }
+        return counts
+    }
+
     func makeWidgetAccountEntries(now: Date) -> [WidgetSnapshot.AccountEntry] {
         defer { self.widgetAccountSnapshotStore?.save(self.widgetVerifiedTokenSnapshots) }
         guard self.settings.accountWidgetsEnabled else {
             self.widgetVerifiedTokenSnapshots = [:]
             return []
         }
-        let providers = self.enabledProviders().compactMap(\.firstPartyProvider)
+        let providers = self.enabledProviders().compactMap(\.firstPartyProvider).filter(Self.supportsWidgetUsage)
         self.widgetVerifiedTokenSnapshots = self.widgetVerifiedTokenSnapshots.filter { providers.contains($0.key) }
         return providers.flatMap { provider in
             self.widgetAccounts(for: provider, now: now)
@@ -31,10 +54,10 @@ extension UsageStore {
             return accounts.compactMap { account in
                 // Slots can be reused. Bind the pin to the same opaque ownership guard as retained usage,
                 // without persisting the adapter's email, organization, or display label.
-                guard let owner = ClaudeSwapRetainedUsageStore.ownershipFingerprint(for: account) else { return nil }
+                guard let id = Self.claudeSwapWidgetOwnerKey(for: account) else { return nil }
                 return self.widgetAccountEntry(
                     provider: provider,
-                    id: "claude/swap:\(account.id.opaqueID):\(owner)",
+                    id: id,
                     label: "Account \(account.id.opaqueID)",
                     snapshot: account.snapshot,
                     now: now)
@@ -149,6 +172,21 @@ extension UsageStore {
         return self.tokenAccountSnapshotCacheKey(provider: provider, account: scoped)
     }
 
+    /// Saved widget pin and quota owner for an account-source slot. The ownership fingerprint hashes only
+    /// slot and email, so each source needs its own namespace or claude-swap slot 1 and tcr slot 1 with the
+    /// same email would share one pin. claude-swap keeps `claude/swap:` byte for byte: pins saved before tcr
+    /// existed must still resolve.
+    static func claudeSwapWidgetOwnerKey(for account: ProviderAccountUsageSnapshot) -> String? {
+        guard let source = ClaudeSwapAccountSource(identitySource: account.id.source),
+              let owner = ClaudeSwapRetainedUsageStore.ownershipFingerprint(for: account)
+        else { return nil }
+        let namespace = switch source {
+        case .claudeSwap: "swap"
+        case .tcr: "tcr"
+        }
+        return "claude/\(namespace):\(account.id.opaqueID):\(owner)"
+    }
+
     static func widgetOpaqueAccountID(_ identity: String) -> String {
         SHA256.hash(data: Data(identity.utf8)).map { String(format: "%02x", $0) }.joined()
     }
@@ -185,7 +223,7 @@ extension UsageStore {
     }
 
     func reconcileCodexWidgetAccountSnapshots(after error: Error? = nil) {
-        guard self.settings.accountWidgetsEnabled, !self.shouldUseAmbientCodexPATForUsage() else {
+        guard !self.shouldUseAmbientCodexPATForUsage() else {
             self.codexAccountSnapshots = []
             return
         }
@@ -193,8 +231,9 @@ extension UsageStore {
             self.codexAccountSnapshots,
             reconciledWith: self.settings.codexVisibleAccountProjection)
         if let error {
+            let activeID = self.settings.codexVisibleAccountProjection.activeVisibleAccountID
             self.codexAccountSnapshots.removeAll {
-                !Self.shouldPreservePriorSnapshot(after: error, hadPriorData: $0.snapshot != nil)
+                $0.id == activeID && !Self.shouldPreservePriorSnapshot(after: error, hadPriorData: $0.snapshot != nil)
             }
         }
     }

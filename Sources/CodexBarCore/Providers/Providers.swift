@@ -48,6 +48,7 @@ public enum UsageProvider: String, CaseIterable, Sendable, Codable {
     case moonshot
     case amp
     case t3chat
+    case langdock
     case ollama
     case synthetic
     case openrouter
@@ -88,6 +89,7 @@ public enum UsageProvider: String, CaseIterable, Sendable, Codable {
     case aiand
     case zoommate
     case xai
+    case xapi
     case notion
     case ibmbob
     case nous
@@ -101,6 +103,7 @@ public enum UsageProvider: String, CaseIterable, Sendable, Codable {
     case typesafe
     case hyper
     case gitkraken
+    case futureagi
     case devpass
     case atlascloud
     case vercel
@@ -108,6 +111,20 @@ public enum UsageProvider: String, CaseIterable, Sendable, Codable {
     case xkiro
     case museai
     case lithosai
+    case workbuddy
+    case tavily
+    case linkup
+    case tinyapi
+    case exa
+    case cosmic
+    case aerostack
+    case sailresearch
+    case sofya
+    case fal
+    case flora
+    case parallel
+    case claudeplatform
+    case munito
 }
 
 // swiftformat:enable sortDeclarations
@@ -164,6 +181,7 @@ public struct ProviderMetadata: Sendable {
     public let cliName: String
     public let defaultEnabled: Bool
     public let widgetSelectable: Bool
+    public let burnDownWidgetSelectable: Bool
     public let isPrimaryProvider: Bool
     public let usesAccountFallback: Bool
     public let sharePlanLabels: [String: String]
@@ -199,6 +217,7 @@ public struct ProviderMetadata: Sendable {
         cliName: String,
         defaultEnabled: Bool,
         widgetSelectable: Bool = true,
+        burnDownWidgetSelectable: Bool = true,
         isPrimaryProvider: Bool = false,
         usesAccountFallback: Bool = false,
         sharePlanLabels: [String: String] = [:],
@@ -228,6 +247,7 @@ public struct ProviderMetadata: Sendable {
         self.cliName = cliName
         self.defaultEnabled = defaultEnabled
         self.widgetSelectable = widgetSelectable
+        self.burnDownWidgetSelectable = burnDownWidgetSelectable
         self.isPrimaryProvider = isPrimaryProvider
         self.usesAccountFallback = usesAccountFallback
         self.sharePlanLabels = sharePlanLabels

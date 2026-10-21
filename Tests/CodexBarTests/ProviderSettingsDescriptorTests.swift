@@ -19,7 +19,7 @@ struct ProviderSettingsDescriptorTests {
         #expect(fixture.settings.providerConfig(for: .xkiro)?.apiKey == "fixture-key")
     }
 
-    @Test(arguments: [UsageProvider.atlascloud, .vercel])
+    @Test(arguments: [UsageProvider.atlascloud])
     func `balance providers keep API keys in their own config`(provider: UsageProvider) throws {
         let fixture = try self.makeSettingsFixture(suite: "ProviderSettingsDescriptorTests-\(provider.rawValue)")
         let implementation = try #require(ProviderCatalog.implementation(for: provider))
@@ -307,6 +307,8 @@ struct ProviderSettingsDescriptorTests {
         let fixture = try self.makeSettingsFixture(suite: "ProviderSettingsDescriptorTests-ollama-refresh")
         let context = fixture.settingsContext(provider: .ollama)
         let pickers = OllamaProviderImplementation().settingsPickers(context: context)
+        let usageSource = try #require(pickers.first { $0.id == "ollama-usage-source" })
+        #expect(usageSource.subtitle.isEmpty)
         let picker = try #require(pickers.first { $0.id == "ollama-cookie-source" })
         let action = try #require(picker.trailingActions.first)
 
@@ -452,13 +454,13 @@ struct ProviderSettingsDescriptorTests {
     }
 
     @Test
-    func `open code cookie refresh respects denial cooldown and preserves cookie`() async throws {
+    func `open code cookie refresh respects denial cooldown and preserves unvalidated cookie`() async throws {
         let fixture = try self.makeSettingsFixture(suite: "ProviderSettingsDescriptorTests-opencode-cooldown")
         let context = fixture.settingsContext(provider: .opencode)
         let picker = try #require(OpenCodeProviderImplementation().settingsPickers(context: context).first)
         let action = try #require(picker.trailingActions.first)
         let service = "com.steipete.codexbar.tests.settings-cookie-cooldown.\(UUID().uuidString)"
-        var cooldownRespected = false
+        var explicitRetryAllowed = false
 
         BrowserCookieAccessGate.resetForTesting()
         BrowserCookieAccessGate.recordDenied(for: .chrome)
@@ -471,13 +473,15 @@ struct ProviderSettingsDescriptorTests {
                     cookieHeader: "old-test-cookie",
                     sourceLabel: "Test old")
                 fixture.store._test_providerRefreshOverride = { _ in
-                    cooldownRespected = !BrowserCookieAccessGate.shouldAttempt(.chrome)
+                    explicitRetryAllowed = KeychainAccessGate.withTaskOverrideForTesting(false) {
+                        BrowserCookieAccessGate.shouldAttempt(.chrome)
+                    }
                 }
                 defer { fixture.store._test_providerRefreshOverride = nil }
 
                 await action.perform()
 
-                #expect(cooldownRespected)
+                #expect(!explicitRetryAllowed)
                 #expect(CookieHeaderCache.load(provider: .opencode)?.cookieHeader == "old-test-cookie")
                 #expect(picker.trailingText?() == L("Failed"))
             }
@@ -946,6 +950,19 @@ extension ProviderSettingsDescriptorTests {
 
         // Web-cookie provider with versionDetector: nil — must not fall back to "zoommate not detected".
         #expect(detailLine == "web")
+    }
+
+    @Test
+    func `jetbrains presentation surfaces local source and hides the undetected version row`() throws {
+        let fixture = try self.makeSettingsFixture(suite: "ProviderSettingsDescriptorTests-jetbrains-presentation")
+        let metadata = try #require(ProviderDescriptorRegistry.metadata[.jetbrains])
+        let context = fixture.presentationContext(provider: .jetbrains, metadata: metadata)
+
+        let presentation = JetBrainsProviderImplementation().presentation(context: context)
+
+        // Local quota-file provider with versionDetector: nil — must not fall back to "jetbrains not detected".
+        #expect(presentation.detailLine(context) == "local")
+        #expect(presentation.showsVersionInSettings == false)
     }
 
     @Test
@@ -1621,7 +1638,8 @@ extension ProviderSettingsDescriptorTests {
             userDefaults: defaults,
             configStore: testConfigStore(suiteName: suite),
             zaiTokenStore: NoopZaiTokenStore(),
-            syntheticTokenStore: NoopSyntheticTokenStore())
+            syntheticTokenStore: NoopSyntheticTokenStore(),
+            keychainAccessPolicy: .init(setDisabled: { _ in }, isExplicitlyDisabled: { false }))
         let store = UsageStore(
             fetcher: UsageFetcher(environment: [:]),
             browserDetection: BrowserDetection(cacheTTL: 0),
